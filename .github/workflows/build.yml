@@ -132,6 +132,23 @@ jobs:
           if (-not $p.WaitForExit(60000)) { $p.Kill(); throw '[slow] did not finish' }
           if ($p.ExitCode -ne 0) { throw "[slow] exit code $($p.ExitCode)" }
           Assert-Uploaded 'slow' $run $env:FAKE_ADB_ROOT 2
+
+          # 완료 폴더 지정 (다른 드라이브 C:): <완료 폴더>\<실행 폴더 이름>\NNN 으로 옮기고 날짜를 보존해야 한다
+          $run = New-Run 'up-done' @(2, 1)
+          $stamp = Get-Date '2015-06-01 10:00'
+          Get-ChildItem $run -Recurse -File | ForEach-Object { $_.CreationTime = $stamp; $_.LastWriteTime = $stamp }
+          $doneDir = 'C:\upload-done'
+          $env:FAKE_ADB_ROOT = Join-Path $env:RUNNER_TEMP 'phone-done'
+          New-Item -ItemType Directory -Force $env:FAKE_ADB_ROOT | Out-Null
+          $p = Start-Process "$bin\Google-Photo-Uploader.exe" -ArgumentList '--upload','--dir',"`"$run`"",'--done-dir',"`"$doneDir`"",'--batch','2','--quiet-seconds','2' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "[done-dir] exit code $($p.ExitCode)" }
+          Get-Content "$run\upload-log.txt" -Encoding utf8 | ForEach-Object { Write-Host "[done-dir] $_" }
+          $moved = @(Get-ChildItem "$doneDir\up-done" -Recurse -File)
+          Write-Host "[done-dir] moved=$($moved.Count) chunks=$((Get-ChildItem "$doneDir\up-done" -Directory).Name -join ',')"
+          if ($moved.Count -ne 3) { throw '[done-dir] expected 3 files in done folder' }
+          if (Test-Path (Join-Path $run '업로드 완료')) { throw '[done-dir] default folder should not be used' }
+          if (@(Get-ChildItem $run -Directory | Where-Object Name -match '^\d{3}$').Count -ne 0) { throw '[done-dir] chunk folders left' }
+          foreach ($f in $moved) { if ($f.CreationTime -ne $stamp -or $f.LastWriteTime -ne $stamp) { throw "[done-dir] dates changed: $($f.Name)" } }
       - name: Package
         shell: pwsh
         run: |

@@ -5,7 +5,7 @@
 //
 // 창 없이 실행(CI 확인용):
 //   Google-Photo-Uploader.exe --organize --dest <저장 폴더> <원본 폴더>...
-//   Google-Photo-Uploader.exe --upload --dir <정리 폴더> --batch <개수> --quiet-seconds <초>
+//   Google-Photo-Uploader.exe --upload --dir <정리 폴더> [--done-dir <완료 폴더>] --batch <개수> --quiet-seconds <초>
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -34,6 +34,8 @@ constexpr wchar_t kRegDest[] = L"Destination";
 constexpr wchar_t kRegLastOutput[] = L"LastOutput";
 constexpr wchar_t kRegUploadMode[] = L"UploadMode";
 constexpr wchar_t kRegQuietMinutes[] = L"QuietMinutes";
+constexpr wchar_t kRegDoneDir[] = L"DoneDir";
+constexpr wchar_t kDefaultDoneText[] = L"(비우면 정리 폴더 안 '업로드 완료')";
 
 // 업로드 방식: 콤보 순서와 같다
 struct UploadMode {
@@ -46,19 +48,22 @@ constexpr UploadMode kModes[] = {{L"슬로우 (1개씩)", 1, 3}, {L"50개씩", 5
 enum : int { IDC_HINT = 100, IDC_LIST, IDC_ADD, IDC_REMOVE, IDC_CLEAR, IDC_DEST_LABEL, IDC_DEST, IDC_DEST_CHANGE,
              IDC_PROGRESS, IDC_STATUS, IDC_DONE,
              IDC_UP_HEADER, IDC_UP_PHONE, IDC_UP_DIR_LABEL, IDC_UP_DIR, IDC_UP_DIR_CHANGE, IDC_UP_MODE_LABEL, IDC_UP_MODE,
-             IDC_UP_QUIET_LABEL, IDC_UP_QUIET, IDC_UP_START, IDC_UP_STATUS, IDC_UP_BACKUP, IDC_UP_LOG };
+             IDC_UP_QUIET_LABEL, IDC_UP_QUIET, IDC_UP_START, IDC_UP_STATUS, IDC_UP_BACKUP, IDC_UP_LOG,
+             IDC_UP_DONE_LABEL, IDC_UP_DONE, IDC_UP_DONE_CHANGE, IDC_UP_DONE_RESET };
 enum : UINT { WM_APP_PROGRESS = WM_APP + 1, WM_APP_FINISHED, WM_APP_UP_LOG, WM_APP_UP_STATUS, WM_APP_UP_DONE, WM_APP_PHONE };
 constexpr UINT_PTR kPhoneTimer = 1;
 
 struct App {
   HWND hwnd = nullptr;
   HWND hint, list, add, remove, clear, destLabel, dest, destChange, progress, status, done;
+  HWND upDoneLabel, upDone, upDoneChange, upDoneReset;
   HWND upHeader, upPhone, upDirLabel, upDir, upDirChange, upModeLabel, upMode, upQuietLabel, upQuiet, upStart, upStatus, upBackup, upLog;
   HFONT font = nullptr, bold = nullptr;
   UINT dpi = 96;
   std::vector<std::wstring> sources;
   std::wstring destRoot;
   std::wstring uploadDir;
+  std::wstring doneDir;  // 비우면 정리 폴더 안 '업로드 완료'
   bool busy = false;
   gpu::Uploader uploader;
   std::atomic<bool> phoneCheck{false};  // 폰 상태 확인이 진행 중
@@ -344,6 +349,8 @@ void UpdateUploadControls() {
   SetWindowTextW(g.upStart, !running ? L"업로드 시작" : g.uploader.Stopping() ? L"중지하는 중..." : L"중지");
   EnableWindow(g.upStart, !g.uploader.Stopping());
   EnableWindow(g.upDirChange, !running);
+  EnableWindow(g.upDoneChange, !running);
+  EnableWindow(g.upDoneReset, !running && !g.doneDir.empty());
   EnableWindow(g.upMode, !running);
   EnableWindow(g.upQuiet, !running);
 }
@@ -354,6 +361,25 @@ void OnUploadDirChange() {
   g.uploadDir = picked.front();
   SaveString(kRegLastOutput, g.uploadDir);
   SetWindowTextW(g.upDir, g.uploadDir.c_str());
+}
+
+void ShowDoneDir() {
+  SetWindowTextW(g.upDone, g.doneDir.empty() ? kDefaultDoneText : g.doneDir.c_str());
+  UpdateUploadControls();
+}
+
+void OnDoneDirChange() {
+  const auto picked = PickFolders(false, L"업로드가 끝난 파일을 옮길 폴더 선택");
+  if (picked.empty()) return;
+  g.doneDir = picked.front();
+  SaveString(kRegDoneDir, g.doneDir);
+  ShowDoneDir();
+}
+
+void OnDoneDirReset() {
+  g.doneDir.clear();
+  SaveString(kRegDoneDir, g.doneDir);
+  ShowDoneDir();
 }
 
 void OnModeChange() {
@@ -386,6 +412,11 @@ void OnUploadStart() {
 
   gpu::UploadOptions opt;
   opt.runDir = g.uploadDir;
+  opt.doneDir = g.doneDir;
+  if (!opt.doneDir.empty() && gpu::IsUnder(opt.doneDir, opt.runDir)) {
+    MessageBoxW(g.hwnd, L"완료 폴더가 업로드 폴더 안에 있으면 안 됩니다. 다른 폴더를 고르세요.", kTitle, MB_ICONWARNING);
+    return;
+  }
   opt.batchSize = kModes[mode].batch;
   opt.quietSeconds = minutes * 60;
   const HWND hwnd = g.hwnd;
@@ -431,7 +462,7 @@ void ApplyFonts() {
   ncm.lfMessageFont.lfWeight = FW_SEMIBOLD;
   g.bold = CreateFontIndirectW(&ncm.lfMessageFont);
   for (HWND h : {g.list, g.add, g.remove, g.clear, g.destLabel, g.dest, g.destChange, g.status, g.upPhone, g.upDirLabel, g.upDir,
-                 g.upDirChange, g.upModeLabel, g.upMode, g.upQuietLabel, g.upQuiet, g.upStart, g.upStatus, g.upBackup, g.upLog})
+                 g.upDirChange, g.upDoneLabel, g.upDone, g.upDoneChange, g.upDoneReset, g.upModeLabel, g.upMode, g.upQuietLabel, g.upQuiet, g.upStart, g.upStatus, g.upBackup, g.upLog})
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
   for (HWND h : {g.hint, g.done, g.upHeader}) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g.bold), TRUE);
 }
@@ -442,7 +473,7 @@ void Layout() {
   const int m = Scale(16), gap = Scale(8), w = rc.right - 2 * m, bh = Scale(30), bw = Scale(110), th = Scale(20), hh = Scale(24);
   // 높이가 고정된 줄을 빼고 남는 높이를 폴더 목록(40%)과 업로드 로그(60%)가 나눠 쓴다
   const int fixed1 = hh + gap + gap + bh + gap * 2 + bh + gap + Scale(18) + gap + th + gap + Scale(40);
-  const int fixed2 = Scale(20) + hh + gap + th + gap + bh + gap + bh + gap + th + Scale(4) + th + gap;
+  const int fixed2 = Scale(20) + hh + gap + th + gap + bh + gap + bh + gap + bh + gap + th + Scale(4) + th + gap;
   const int flexible = (std::max)(Scale(160), static_cast<int>(rc.bottom) - 2 * m - fixed1 - fixed2);
   const int listH = flexible * 4 / 10;
   const int lw = Scale(80);
@@ -474,6 +505,12 @@ void Layout() {
   MoveWindow(g.upDirLabel, m, y + Scale(6), lw, th, TRUE);
   MoveWindow(g.upDir, m + lw, y + Scale(2), w - lw - bw - gap, Scale(26), TRUE);
   MoveWindow(g.upDirChange, rc.right - m - bw, y, bw, bh, TRUE);
+  y += bh + gap;
+  const int sw = Scale(56);  // [기본] 버튼
+  MoveWindow(g.upDoneLabel, m, y + Scale(6), lw, th, TRUE);
+  MoveWindow(g.upDone, m + lw, y + Scale(2), w - lw - bw - gap - sw - gap, Scale(26), TRUE);
+  MoveWindow(g.upDoneReset, rc.right - m - bw - gap - sw, y, sw, bh, TRUE);
+  MoveWindow(g.upDoneChange, rc.right - m - bw, y, bw, bh, TRUE);
   y += bh + gap;
   MoveWindow(g.upModeLabel, m, y + Scale(6), lw, th, TRUE);
   MoveWindow(g.upMode, m + lw, y + Scale(2), Scale(150), Scale(200), TRUE);
@@ -538,6 +575,10 @@ void Create(HWND hwnd) {
   g.upDirLabel = Make(L"STATIC", L"업로드 폴더", SS_LEFT, IDC_UP_DIR_LABEL);
   g.upDir = Make(WC_EDITW, g.uploadDir.c_str(), ES_READONLY | ES_AUTOHSCROLL, IDC_UP_DIR, WS_EX_CLIENTEDGE);
   g.upDirChange = Make(WC_BUTTONW, L"변경...", BS_PUSHBUTTON | WS_TABSTOP, IDC_UP_DIR_CHANGE);
+  g.upDoneLabel = Make(L"STATIC", L"완료 폴더", SS_LEFT, IDC_UP_DONE_LABEL);
+  g.upDone = Make(WC_EDITW, L"", ES_READONLY | ES_AUTOHSCROLL, IDC_UP_DONE, WS_EX_CLIENTEDGE);
+  g.upDoneReset = Make(WC_BUTTONW, L"기본", BS_PUSHBUTTON | WS_TABSTOP, IDC_UP_DONE_RESET);
+  g.upDoneChange = Make(WC_BUTTONW, L"변경...", BS_PUSHBUTTON | WS_TABSTOP, IDC_UP_DONE_CHANGE);
   g.upModeLabel = Make(L"STATIC", L"방식", SS_LEFT, IDC_UP_MODE_LABEL);
   g.upMode = Make(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_UP_MODE);
   for (const auto& mode : kModes) SendMessageW(g.upMode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(mode.label));
@@ -551,6 +592,7 @@ void Create(HWND hwnd) {
   g.upBackup = Make(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, IDC_UP_BACKUP);
   g.upLog = Make(WC_EDITW, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, IDC_UP_LOG, WS_EX_CLIENTEDGE);
   SendMessageW(g.upLog, EM_SETLIMITTEXT, 1 << 20, 0);
+  ShowDoneDir();
   SetTimer(hwnd, kPhoneTimer, 3000, nullptr);
   CheckPhoneAsync();
   ApplyFonts();
@@ -579,7 +621,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_CTLCOLORSTATIC:
-      if (reinterpret_cast<HWND>(lp) == g.dest || reinterpret_cast<HWND>(lp) == g.upDir || reinterpret_cast<HWND>(lp) == g.upLog) break;
+      if (reinterpret_cast<HWND>(lp) == g.dest || reinterpret_cast<HWND>(lp) == g.upDir || reinterpret_cast<HWND>(lp) == g.upDone ||
+          reinterpret_cast<HWND>(lp) == g.upLog)
+        break;
       SetBkMode(reinterpret_cast<HDC>(wp), TRANSPARENT);
       return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     case WM_DROPFILES:
@@ -600,6 +644,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           break;
         case IDC_UP_DIR_CHANGE: OnUploadDirChange(); break;
         case IDC_UP_START: OnUploadStart(); break;
+        case IDC_UP_DONE_CHANGE: OnDoneDirChange(); break;
+        case IDC_UP_DONE_RESET: OnDoneDirReset(); break;
         case IDC_UP_MODE:
           if (HIWORD(wp) == CBN_SELCHANGE) OnModeChange();
           break;
@@ -680,6 +726,7 @@ int RunHeadlessUpload(int argc, wchar_t** argv) {
   gpu::UploadOptions opt;
   for (int i = 2; i + 1 < argc; i += 2) {
     if (wcscmp(argv[i], L"--dir") == 0) opt.runDir = argv[i + 1];
+    else if (wcscmp(argv[i], L"--done-dir") == 0) opt.doneDir = argv[i + 1];
     else if (wcscmp(argv[i], L"--batch") == 0) opt.batchSize = static_cast<size_t>((std::max)(1, _wtoi(argv[i + 1])));
     else if (wcscmp(argv[i], L"--quiet-seconds") == 0) opt.quietSeconds = (std::max)(1, _wtoi(argv[i + 1]));
   }
@@ -719,6 +766,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   InitCommonControlsEx(&icc);
   g.destRoot = LoadDest();
   g.uploadDir = LoadString(kRegLastOutput);
+  g.doneDir = LoadString(kRegDoneDir);
 
   WNDCLASSEXW wc{sizeof(wc)};
   wc.lpfnWndProc = WndProc;

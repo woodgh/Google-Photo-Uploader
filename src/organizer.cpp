@@ -245,6 +245,18 @@ std::wstring VolumeOf(const std::wstring& path) {
   return volume;
 }
 
+bool MovePreservingMetadata(const std::wstring& src, const std::wstring& dst, std::wstring& error, bool& metadataRestored) {
+  FILE_BASIC_INFO original{};
+  const bool haveInfo = GetBasicInfo(src, original);
+  if (!MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+    error = ErrorText(GetLastError());
+    return false;
+  }
+  metadataRestored = !haveInfo || RestoreBasicInfo(dst, original);
+  if (!metadataRestored) error = ErrorText(GetLastError());
+  return true;
+}
+
 OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wstring& destRoot, const ProgressFn& progress) {
   OrganizeResult result;
 
@@ -327,14 +339,13 @@ OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wst
   progress(Phase::Move, 0, ready.size());
   RunOnIocp(ready.size(), result.threads, [&](size_t i) {
     const auto& item = ready[i];
-    FILE_BASIC_INFO original{};
-    const bool haveInfo = GetBasicInfo(item.path, original);
-    if (!MoveFileExW(item.path.c_str(), item.target.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
-      moveErrors[i] = item.path + L": " + ErrorText(GetLastError());
+    std::wstring error;
+    bool restored = true;
+    if (!MovePreservingMetadata(item.path, item.target, error, restored)) {
+      moveErrors[i] = item.path + L": " + error;
     } else {
       movedFlags[i] = 1;
-      if (haveInfo && !RestoreBasicInfo(item.target, original))
-        metaErrors[i] = item.target + L": 날짜 복원 실패 - " + ErrorText(GetLastError());
+      if (!restored) metaErrors[i] = item.target + L": 날짜 복원 실패 - " + error;
     }
     progress(Phase::Move, moved.fetch_add(1) + 1, ready.size());
   });

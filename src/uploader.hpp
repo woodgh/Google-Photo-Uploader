@@ -2,7 +2,8 @@
 // 정리된 폴더(<실행 시각>\001, 002 ...)의 파일을 묶음 단위로 Pixel 폰에 넣고, Google 포토 백업이 끝나면 다음 묶음을 넣는다.
 //  1. 묶음(1/50/100개)을 폰 DCIM/Camera로 복사하고 미디어 스캔
 //  2. Google 포토 알림을 지켜본다. 알림이 바뀌면 다시 센다
-//  3. 백업 중이 아니고 정한 시간 동안 변동이 없으면 완료 → PC 파일을 <실행 시각>\업로드 완료\NNN\ 으로 옮기고 폰 사본 삭제
+//  3. 백업 중이 아니고 정한 시간 동안 변동이 없으면 완료 → PC 파일을 완료 폴더로 옮기고 폰 사본 삭제
+//     완료 폴더: 지정하면 <완료 폴더>\<실행 시각>\NNN, 비우면 <실행 시각>\업로드 완료\NNN
 //  4. 다음 묶음으로. 앱을 다시 켜면 폰에 남아 있는 파일을 현재 묶음으로 보고 이어서 한다.
 #include <atomic>
 #include <functional>
@@ -15,6 +16,7 @@ inline constexpr wchar_t kUploadedFolder[] = L"업로드 완료";
 
 struct UploadOptions {
   std::wstring runDir;
+  std::wstring doneDir;  // 비우면 runDir\업로드 완료
   size_t batchSize = 100;
   int quietSeconds = 30 * 60;
 };
@@ -52,6 +54,9 @@ class Uploader {
   std::thread thread_;
   std::atomic<bool> stop_{false}, running_{false};
 };
+
+// 업로드가 끝난 파일이 들어갈 폴더 (그 안에 NNN 폴더)
+std::wstring UploadedRoot(const UploadOptions& options);
 
 // 폰 연결 상태 한 줄 (업로드 중이 아닐 때 화면 표시용)
 std::wstring DescribePhone();

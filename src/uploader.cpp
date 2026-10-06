@@ -1,6 +1,7 @@
 #include "uploader.hpp"
 
 #include <windows.h>
+#include <shlobj.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "adb.hpp"
+#include "organizer.hpp"
 #include "phone_model.hpp"
 
 namespace gpu {
@@ -53,9 +55,8 @@ std::vector<PcFile> ListPending(const std::wstring& runDir) {
   return files;
 }
 
-size_t CountUploaded(const std::wstring& runDir) {
+size_t CountUploaded(const std::wstring& done) {
   size_t n = 0;
-  const auto done = runDir + L"\\" + kUploadedFolder;
   ForEachEntry(done, [&](const WIN32_FIND_DATAW& chunk) {
     if (chunk.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
       ForEachEntry(done + L"\\" + chunk.cFileName, [&](const WIN32_FIND_DATAW& f) {
@@ -119,6 +120,13 @@ std::wstring Clock() {
 
 }  // namespace
 
+std::wstring UploadedRoot(const UploadOptions& o) {
+  if (o.doneDir.empty()) return o.runDir + L"\\" + kUploadedFolder;
+  auto run = o.runDir;
+  while (!run.empty() && (run.back() == L'\\' || run.back() == L'/')) run.pop_back();
+  return o.doneDir + L"\\" + run.substr(run.find_last_of(L"\\/") + 1);
+}
+
 std::wstring DescribePhone() {
   Adb adb;
   std::wstring state;
@@ -160,6 +168,8 @@ void Uploader::Run(UploadOptions opt, UploadEvents ev) {
       std::to_wstring(opt.quietSeconds / 60) + L"분" + (opt.quietSeconds % 60 ? L" " + std::to_wstring(opt.quietSeconds % 60) + L"초" : L"") +
       L" 후 완료)");
 
+  const auto doneRoot = UploadedRoot(opt);
+  log(L"완료 폴더: " + doneRoot);
   std::vector<PcFile> batch;
   QuietTimer timer;
   std::string serial;
@@ -188,7 +198,7 @@ void Uploader::Run(UploadOptions opt, UploadEvents ev) {
     if (batch.empty()) {
       // 다음 묶음: 폰에 이미 있는 파일(이전 실행에서 넣은 것)부터, 모자라면 새로 넣는다
       auto pending = ListPending(opt.runDir);
-      st.uploaded = CountUploaded(opt.runDir);
+      st.uploaded = CountUploaded(doneRoot);
       st.total = st.uploaded + pending.size();
       if (pending.empty()) {
         st.stage = L"모두 완료";
@@ -262,17 +272,22 @@ void Uploader::Run(UploadOptions opt, UploadEvents ev) {
     if (timer.Done(now, opt.quietSeconds)) {
       log(std::to_wstring(opt.quietSeconds / 60) + L"분" + (opt.quietSeconds % 60 ? L" " + std::to_wstring(opt.quietSeconds % 60) + L"초" : L"") +
           L" 동안 변동 없음 → " + std::to_wstring(batch.size()) + L"개 업로드 완료로 판단");
-      // PC: <runDir>\업로드 완료\NNN\ 으로 이동
+      // PC: 완료 폴더\NNN\ 으로 이동 (다른 드라이브여도 날짜·속성 보존)
       size_t moved = 0;
       std::set<std::wstring> chunks;
       for (const auto& f : batch) {
-        const auto dir = opt.runDir + L"\\" + kUploadedFolder + L"\\" + f.chunk;
-        CreateDirectoryW((opt.runDir + L"\\" + kUploadedFolder).c_str(), nullptr);
-        CreateDirectoryW(dir.c_str(), nullptr);
-        if (MoveFileExW(f.path.c_str(), (dir + L"\\" + Utf8ToWide(f.name)).c_str(), MOVEFILE_COPY_ALLOWED))
+        const auto dir = doneRoot + L"\\" + f.chunk;
+        const int rc = SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        std::wstring error;
+        bool restored = true;
+        if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS) {
+          log(L"완료 폴더를 만들 수 없음: " + dir);
+        } else if (!MovePreservingMetadata(f.path, dir + L"\\" + Utf8ToWide(f.name), error, restored)) {
+          log(L"PC 이동 실패: " + f.path + L" — " + error);
+        } else {
           ++moved;
-        else
-          log(L"PC 이동 실패: " + f.path);
+          if (!restored) log(L"날짜 복원 실패: " + f.path + L" — " + error);
+        }
         chunks.insert(opt.runDir + L"\\" + f.chunk);
       }
       for (const auto& c : chunks) RemoveDirectoryW(c.c_str());  // 비었으면 지운다
@@ -281,8 +296,7 @@ void Uploader::Run(UploadOptions opt, UploadEvents ev) {
       for (const auto& f : batch) cmds.push_back("rm -f " + PhonePath(f.name));
       for (const auto& f : batch) cmds.push_back(ScanCommand(f.name));
       ShellBatch(adb, serial, cmds);
-      log(L"PC '" + std::wstring(kUploadedFolder) + L"' 폴더로 " + std::to_wstring(moved) + L"개 이동, 폰에서 " + std::to_wstring(batch.size()) +
-          L"개 삭제");
+      log(L"PC 완료 폴더로 " + std::to_wstring(moved) + L"개 이동, 폰에서 " + std::to_wstring(batch.size()) + L"개 삭제");
       batch.clear();
       continue;
     }

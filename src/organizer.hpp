@@ -25,6 +25,10 @@ using ProgressFn = std::function<void(Phase, size_t, size_t)>;
 // 경로가 속한 볼륨의 루트 ("C:\\"). 실패하면 빈 문자열.
 std::wstring VolumeOf(const std::wstring& path);
 
+// 파일 이동 (다른 드라이브면 OS가 복사 후 원본 삭제). 만든·수정·접근 날짜와 속성을 원래 값으로 맞춘다.
+// 이동 실패 시 false + error. 이동은 됐지만 날짜 복원에 실패하면 true + metadataRestored=false + error.
+bool MovePreservingMetadata(const std::wstring& src, const std::wstring& dst, std::wstring& error, bool& metadataRestored);
+
 // 호출 스레드에서 COM이 초기화되어 있어야 한다.
 OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wstring& destRoot, const ProgressFn& progress);
 
