@@ -9,7 +9,10 @@
 #include <propkey.h>
 
 #include <algorithm>
+#include <atomic>
 #include <set>
+#include <thread>
+#include <vector>
 
 #include "core.hpp"
 
@@ -21,6 +24,7 @@ struct Item {
   FILETIME lastWrite{};
   Stamp stamp;
   std::wstring hash;
+  std::wstring target;  // 옮길 경로 (이동 단계에서 정함)
 };
 
 std::wstring JoinPath(const std::wstring& dir, const std::wstring& name) {
@@ -73,8 +77,8 @@ class Sha256 {
     if (alg_) BCryptCloseAlgorithmProvider(alg_, 0);
   }
 
-  // 파일 내용의 SHA-256 (hex). 실패하면 빈 문자열 + error.
-  std::wstring File(const std::wstring& path, DWORD& error) {
+  // 파일 내용의 SHA-256 (hex). 실패하면 빈 문자열 + error. 여러 스레드에서 동시에 불러도 된다.
+  std::wstring File(const std::wstring& path, DWORD& error) const {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
       error = GetLastError();
@@ -83,11 +87,11 @@ class Sha256 {
     BCRYPT_HASH_HANDLE hash = nullptr;
     std::wstring hex;
     if (alg_ && BCRYPT_SUCCESS(BCryptCreateHash(alg_, &hash, nullptr, 0, nullptr, 0, 0))) {
-      buffer_.resize(1 << 20);
+      std::vector<uint8_t> buffer(1 << 20);
       DWORD read = 0;
       bool ok = true;
-      while ((ok = ReadFile(file, buffer_.data(), static_cast<DWORD>(buffer_.size()), &read, nullptr) != FALSE) && read > 0)
-        BCryptHashData(hash, buffer_.data(), read, 0);
+      while ((ok = ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) != FALSE) && read > 0)
+        BCryptHashData(hash, buffer.data(), read, 0);
       uint8_t digest[32];
       if (!ok)
         error = GetLastError();
@@ -105,7 +109,6 @@ class Sha256 {
 
  private:
   BCRYPT_ALG_HANDLE alg_ = nullptr;
-  std::vector<uint8_t> buffer_;
 };
 
 struct Collector {
@@ -163,6 +166,12 @@ struct Collector {
 
 bool Exists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
 
+// 동시에 실행할 수 있는 스레드 수 (논리 프로세서 수). 읽기·이동 워커 수와 IOCP 동시 실행 수에 쓴다.
+size_t ConcurrentThreads() {
+  const DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  return n > 0 ? n : (std::max)(1u, std::thread::hardware_concurrency());
+}
+
 std::wstring NewRunDir(const std::wstring& destRoot) {
   SYSTEMTIME now;
   GetLocalTime(&now);
@@ -173,7 +182,68 @@ std::wstring NewRunDir(const std::wstring& destRoot) {
   return dir;
 }
 
+// IOCP를 작업 큐로 쓰는 스레드 풀: 0..count-1 작업을 threads개 워커가 나눠 처리한다.
+// 워커마다 COM(MTA)을 초기화한다. 포트를 만들 수 없으면 호출 스레드에서 차례로 처리한다.
+template <class Fn>
+void RunOnIocp(size_t count, size_t threads, const Fn& fn) {
+  if (count == 0) return;
+  threads = (std::max)(size_t{1}, (std::min)(threads, count));
+  HANDLE port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, static_cast<DWORD>(threads));
+  if (!port) {
+    for (size_t i = 0; i < count; ++i) fn(i);
+    return;
+  }
+  auto worker = [&] {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* ov = nullptr;
+    // key = 작업 번호 + 1, 0은 종료 신호
+    while (GetQueuedCompletionStatus(port, &bytes, &key, &ov, INFINITE) && key != 0) fn(static_cast<size_t>(key - 1));
+    if (SUCCEEDED(com)) CoUninitialize();
+  };
+  std::vector<std::thread> pool;
+  for (size_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+  for (size_t i = 0; i < count; ++i) PostQueuedCompletionStatus(port, 0, static_cast<ULONG_PTR>(i + 1), nullptr);
+  for (size_t t = 0; t < threads; ++t) PostQueuedCompletionStatus(port, 0, 0, nullptr);  // 작업 뒤에 들어가므로 모두 끝난 뒤 종료
+  for (auto& t : pool) t.join();
+  CloseHandle(port);
+}
+
+bool GetBasicInfo(const std::wstring& path, FILE_BASIC_INFO& info) {
+  HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  const BOOL ok = GetFileInformationByHandleEx(h, FileBasicInfo, &info, sizeof(info));
+  CloseHandle(h);
+  return ok != FALSE;
+}
+
+// 다른 드라이브로 옮기면 OS가 복사 후 원본을 지우므로 만든 날짜 등이 바뀔 수 있다 → 원래 값으로 되돌린다.
+// 같은 드라이브 이동(이름 바꾸기)은 이미 그대로라 아무것도 쓰지 않는다.
+bool RestoreBasicInfo(const std::wstring& path, const FILE_BASIC_INFO& original) {
+  FILE_BASIC_INFO now{};
+  if (!GetBasicInfo(path, now)) return false;
+  if (now.CreationTime.QuadPart == original.CreationTime.QuadPart && now.LastWriteTime.QuadPart == original.LastWriteTime.QuadPart &&
+      now.LastAccessTime.QuadPart == original.LastAccessTime.QuadPart && now.FileAttributes == original.FileAttributes)
+    return true;
+  HANDLE h = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                         OPEN_EXISTING, 0, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  FILE_BASIC_INFO info = original;
+  info.ChangeTime.QuadPart = 0;  // 0 = 바꾸지 않음
+  const BOOL ok = SetFileInformationByHandle(h, FileBasicInfo, &info, sizeof(info));
+  CloseHandle(h);
+  return ok != FALSE;
+}
+
 }  // namespace
+
+std::wstring VolumeOf(const std::wstring& path) {
+  wchar_t volume[MAX_PATH];
+  if (!GetVolumePathNameW(path.c_str(), volume, MAX_PATH)) return {};
+  return volume;
+}
 
 OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wstring& destRoot, const ProgressFn& progress) {
   OrganizeResult result;
@@ -187,21 +257,31 @@ OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wst
   result.skipped = collector.skipped;
   auto& items = collector.items;
 
-  // 촬영 시각 + 내용 해시
-  Sha256 sha;
-  std::vector<Item> ready;
-  ready.reserve(items.size());
-  for (size_t i = 0; i < items.size(); ++i) {
-    progress(Phase::Scan, i, items.size());
+  // 촬영 시각 + 내용 해시. 논리 프로세서 수만큼의 스레드로 읽는다.
+  // 결과는 아래에서 정렬하므로 읽는 순서는 결과에 영향이 없다.
+  std::vector<std::wstring> errors(items.size());
+  std::atomic<size_t> done{0};
+  const Sha256 sha;
+  result.threads = ConcurrentThreads();
+  progress(Phase::Scan, 0, items.size());
+  RunOnIocp(items.size(), result.threads, [&](size_t i) {
     auto& item = items[i];
     DWORD error = 0;
     item.hash = sha.File(item.path, error);
-    if (item.hash.empty()) {
-      result.failed.push_back(item.path + L": " + ErrorText(error));
-      continue;
-    }
-    item.stamp = ReadStamp(item);
-    ready.push_back(std::move(item));
+    if (item.hash.empty())
+      errors[i] = item.path + L": " + ErrorText(error);
+    else
+      item.stamp = ReadStamp(item);
+    progress(Phase::Scan, done.fetch_add(1) + 1, items.size());
+  });
+
+  std::vector<Item> ready;
+  ready.reserve(items.size());
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (errors[i].empty())
+      ready.push_back(std::move(items[i]));
+    else
+      result.failed.push_back(std::move(errors[i]));
   }
   progress(Phase::Scan, items.size(), items.size());
   if (ready.empty()) return result;
@@ -213,41 +293,69 @@ OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wst
     return Lower(a.path) < Lower(b.path);
   });
 
+  // 옮길 자리를 정렬 순서대로 미리 정한다 (100개씩 001, 002 ...). 같은 이름은 _2, _3.
   result.outputDir = NewRunDir(destRoot);
-  size_t chunk = 0, inChunk = 0;
-  std::wstring chunkDir;
-  for (size_t i = 0; i < ready.size(); ++i) {
-    progress(Phase::Move, i, ready.size());
-    if (chunkDir.empty()) {
-      chunkDir = JoinPath(result.outputDir, ChunkFolderName(chunk));
-      const int rc = SHCreateDirectoryExW(nullptr, chunkDir.c_str(), nullptr);
-      if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS) {
-        result.failed.push_back(chunkDir + L": " + ErrorText(static_cast<DWORD>(rc)));
-        break;
-      }
-    }
-    const auto& item = ready[i];
-    const auto ext = ExtensionOf(item.path);
-    std::wstring target;
-    for (int n = 0;; ++n) {
-      target = JoinPath(chunkDir, MakeFileName(item.stamp, item.hash, ext, n));
-      if (!Exists(target)) break;
-    }
-    if (!MoveFileExW(item.path.c_str(), target.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
-      result.failed.push_back(item.path + L": " + ErrorText(GetLastError()));
-      continue;
-    }
-    ++result.moved;
-    if (++inChunk == kFilesPerFolder) {
-      ++chunk;
-      inChunk = 0;
-      chunkDir.clear();
+  const size_t chunkCount = ChunkCount(ready.size());
+  std::vector<std::wstring> chunkDirs(chunkCount);
+  for (size_t c = 0; c < chunkCount; ++c) {
+    chunkDirs[c] = JoinPath(result.outputDir, ChunkFolderName(c));
+    const int rc = SHCreateDirectoryExW(nullptr, chunkDirs[c].c_str(), nullptr);
+    if (rc != ERROR_SUCCESS && rc != ERROR_ALREADY_EXISTS) {
+      result.failed.push_back(chunkDirs[c] + L": " + ErrorText(static_cast<DWORD>(rc)));
+      for (auto& d : chunkDirs) RemoveDirectoryW(d.c_str());
+      RemoveDirectoryW(result.outputDir.c_str());
+      result.outputDir.clear();
+      return result;
     }
   }
-  progress(Phase::Move, ready.size(), ready.size());
-  result.chunks = chunk + (inChunk > 0 ? 1 : 0);
+  std::set<std::wstring> taken;
+  for (size_t i = 0; i < ready.size(); ++i) {
+    auto& item = ready[i];
+    const auto ext = ExtensionOf(item.path);
+    for (int n = 0;; ++n) {
+      item.target = JoinPath(chunkDirs[i / kFilesPerFolder], MakeFileName(item.stamp, item.hash, ext, n));
+      if (!taken.count(Lower(item.target)) && !Exists(item.target)) break;
+    }
+    taken.insert(Lower(item.target));
+  }
+
+  // 이동: IOCP 작업 큐 + 워커 스레드. 복사본을 남기지 않는다(다른 드라이브면 OS가 복사 후 원본 삭제).
+  // 파일 내용(EXIF 등)과 대체 데이터 스트림은 OS가 그대로 옮기고, 날짜·속성은 원래 값으로 맞춘다.
+  std::vector<std::wstring> moveErrors(ready.size()), metaErrors(ready.size());
+  std::vector<char> movedFlags(ready.size(), 0);
+  std::atomic<size_t> moved{0};
+  progress(Phase::Move, 0, ready.size());
+  RunOnIocp(ready.size(), result.threads, [&](size_t i) {
+    const auto& item = ready[i];
+    FILE_BASIC_INFO original{};
+    const bool haveInfo = GetBasicInfo(item.path, original);
+    if (!MoveFileExW(item.path.c_str(), item.target.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) {
+      moveErrors[i] = item.path + L": " + ErrorText(GetLastError());
+    } else {
+      movedFlags[i] = 1;
+      if (haveInfo && !RestoreBasicInfo(item.target, original))
+        metaErrors[i] = item.target + L": 날짜 복원 실패 - " + ErrorText(GetLastError());
+    }
+    progress(Phase::Move, moved.fetch_add(1) + 1, ready.size());
+  });
+
+  std::vector<size_t> perChunk(chunkCount, 0);
+  for (size_t i = 0; i < ready.size(); ++i) {
+    if (movedFlags[i]) {
+      ++result.moved;
+      ++perChunk[i / kFilesPerFolder];
+    } else {
+      result.failed.push_back(std::move(moveErrors[i]));
+    }
+    if (!metaErrors[i].empty()) result.warnings.push_back(std::move(metaErrors[i]));
+  }
+  for (size_t c = 0; c < chunkCount; ++c) {
+    if (perChunk[c])
+      ++result.chunks;
+    else
+      RemoveDirectoryW(chunkDirs[c].c_str());
+  }
   if (result.moved == 0) {
-    RemoveDirectoryW(chunkDir.c_str());
     RemoveDirectoryW(result.outputDir.c_str());
     result.outputDir.clear();
   }

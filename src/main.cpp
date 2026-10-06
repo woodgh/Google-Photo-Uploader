@@ -173,6 +173,16 @@ void OnDone() {
       return;
     }
   }
+  // 다른 드라이브면 이동이 복사 후 원본 삭제로 처리되어 오래 걸린다 → 시작 전에 확인.
+  std::wstring otherDrive;
+  const auto destVolume = gpu::Lower(gpu::VolumeOf(g.destRoot));
+  for (const auto& s : g.sources)
+    if (gpu::Lower(gpu::VolumeOf(s)) != destVolume) otherDrive += s + L"\n";
+  if (!otherDrive.empty()) {
+    const auto msg = L"다음 항목은 저장 폴더와 다른 드라이브에 있습니다.\n\n" + otherDrive +
+                     L"\n드라이브 사이 이동은 파일을 옮겨 쓴 뒤 원본을 지우므로 시간이 걸립니다. (원본은 남지 않고 날짜는 보존됩니다)\n계속할까요?";
+    if (MessageBoxW(g.hwnd, msg.c_str(), kTitle, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+  }
   g.busy = true;
   UpdateButtons();
   SendMessageW(g.progress, PBM_SETPOS, 0, 0);
@@ -203,13 +213,17 @@ void OnFinished(std::unique_ptr<gpu::OrganizeResult> r) {
   std::wstring text = std::to_wstring(r->moved) + L"개 파일을 " + std::to_wstring(r->chunks) + L"개 폴더로 옮겼습니다.";
   if (r->skipped) text += L"  사진·동영상이 아닌 " + std::to_wstring(r->skipped) + L"개는 그대로 두었습니다.";
   if (!r->failed.empty()) text += L"  실패 " + std::to_wstring(r->failed.size()) + L"개.";
+  if (!r->warnings.empty()) text += L"  날짜 복원 실패 " + std::to_wstring(r->warnings.size()) + L"개.";
   SetStatus(text);
-  if (!r->failed.empty()) {
-    std::wstring detail = L"옮기지 못한 파일:\n\n";
-    for (size_t i = 0; i < r->failed.size() && i < 20; ++i) detail += r->failed[i] + L"\n";
-    if (r->failed.size() > 20) detail += L"... 외 " + std::to_wstring(r->failed.size() - 20) + L"개\n";
+  auto showList = [](const wchar_t* heading, const std::vector<std::wstring>& list) {
+    if (list.empty()) return;
+    std::wstring detail = heading;
+    for (size_t i = 0; i < list.size() && i < 20; ++i) detail += list[i] + L"\n";
+    if (list.size() > 20) detail += L"... 외 " + std::to_wstring(list.size() - 20) + L"개\n";
     MessageBoxW(g.hwnd, detail.c_str(), kTitle, MB_ICONWARNING);
-  }
+  };
+  showList(L"옮기지 못한 파일:\n\n", r->failed);
+  showList(L"옮겼지만 날짜·속성을 원래대로 되돌리지 못한 파일:\n\n", r->warnings);
   if (r->moved > 0) {
     OnClear();
     SetStatus(text);
@@ -386,10 +400,12 @@ int RunHeadless(int argc, wchar_t** argv) {
   if (AttachConsole(ATTACH_PARENT_PROCESS)) {
     FILE* out = nullptr;
     _wfreopen_s(&out, L"CONOUT$", L"w", stdout);
-    wprintf(L"moved=%zu chunks=%zu skipped=%zu failed=%zu output=%ls\n", r.moved, r.chunks, r.skipped, r.failed.size(), r.outputDir.c_str());
+    wprintf(L"moved=%zu chunks=%zu skipped=%zu failed=%zu warnings=%zu threads=%zu output=%ls\n", r.moved, r.chunks, r.skipped,
+            r.failed.size(), r.warnings.size(), r.threads, r.outputDir.c_str());
     for (const auto& f : r.failed) wprintf(L"failed: %ls\n", f.c_str());
+    for (const auto& w : r.warnings) wprintf(L"warning: %ls\n", w.c_str());
   }
-  return r.failed.empty() ? 0 : 2;
+  return r.failed.empty() && r.warnings.empty() ? 0 : 2;
 }
 
 }  // namespace

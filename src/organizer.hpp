@@ -14,11 +14,16 @@ struct OrganizeResult {
   size_t moved = 0;
   size_t chunks = 0;
   size_t skipped = 0;                // 사진·동영상이 아니라 그대로 둔 파일
-  std::vector<std::wstring> failed;  // "경로: 사유"
+  size_t threads = 1;                  // 읽기·이동 워커 스레드 수 (논리 프로세서 수)
+  std::vector<std::wstring> failed;    // 옮기지 못한 파일 "경로: 사유"
+  std::vector<std::wstring> warnings;  // 옮겼지만 날짜·속성을 되돌리지 못한 파일
 };
 
-// progress(phase, done, total): 작업 스레드에서 호출된다.
+// progress(phase, done, total): 작업 스레드에서 호출된다. 읽기·이동 단계에서는 여러 스레드가 동시에 부른다.
 using ProgressFn = std::function<void(Phase, size_t, size_t)>;
+
+// 경로가 속한 볼륨의 루트 ("C:\\"). 실패하면 빈 문자열.
+std::wstring VolumeOf(const std::wstring& path);
 
 // 호출 스레드에서 COM이 초기화되어 있어야 한다.
 OrganizeResult Organize(const std::vector<std::wstring>& sources, const std::wstring& destRoot, const ProgressFn& progress);

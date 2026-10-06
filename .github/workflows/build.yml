@@ -27,27 +27,53 @@ jobs:
         run: cmake --build build --config Release --parallel
       - name: Test naming rules
         run: ctest --test-dir build -C Release --output-on-failure
-      # 창 없이 실제 정리를 돌려 본다: 사진 250개 + 문서 3개 → 001(100) 002(100) 003(50), 문서는 제자리.
+      # 창 없이 실제 정리를 돌려 본다: 사진 150개 + 동영상 100개 + 문서 3개 → 001(100) 002(100) 003(50), 문서는 제자리.
+      # 같은 드라이브(D: → D:)와 다른 드라이브(D: → C:) 모두: 원본이 남지 않고, 내용·만든 날짜·수정 날짜가 그대로인지 확인한다.
       - name: Organize smoke test
         shell: pwsh
         run: |
-          $src = Join-Path $env:RUNNER_TEMP 'smoke-src'
-          $dest = Join-Path $env:RUNNER_TEMP 'smoke-dest'
-          New-Item -ItemType Directory -Force "$src\a\sub", "$src\b" | Out-Null
-          1..150 | ForEach-Object { Set-Content "$src\a\sub\IMG_$_.JPG" "photo-a-$_" }
-          1..100 | ForEach-Object { Set-Content "$src\b\VID_$_.mp4" "video-b-$_" }
-          1..3 | ForEach-Object { Set-Content "$src\b\note_$_.txt" "note-$_" }
-          $p = Start-Process -FilePath build\Release\Google-Photo-Uploader.exe -ArgumentList '--organize','--dest',"`"$dest`"","`"$src\a`"","`"$src\b`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "unexpected exit code $($p.ExitCode)" }
-          $run = Get-ChildItem $dest -Directory | Select-Object -First 1
-          $chunks = Get-ChildItem $run.FullName -Directory | Sort-Object Name
-          $counts = ($chunks | ForEach-Object { (Get-ChildItem $_.FullName -File).Count }) -join ','
-          Write-Host "run=$($run.Name) chunks=$($chunks.Name -join ',') counts=$counts"
-          if (($chunks.Name -join ',') -ne '001,002,003' -or $counts -ne '100,100,50') { throw 'unexpected chunks' }
-          $bad = Get-ChildItem $run.FullName -Recurse -File | Where-Object { $_.Name -notmatch '^\d{4}_\d{2}_\d{2}_\d{2}_[0-9a-f]{8}(_\d+)?\.(jpg|mp4)$' }
-          if ($bad) { throw "unexpected names: $($bad.Name -join ', ')" }
-          if ((Get-ChildItem $src -Recurse -File -Include *.jpg, *.mp4).Count -ne 0) { throw 'media left in source' }
-          if ((Get-ChildItem $src -Recurse -File -Include *.txt).Count -ne 3) { throw 'non-media files were moved' }
+          function Test-Organize([string]$name, [string]$dest) {
+            $src = Join-Path $env:RUNNER_TEMP "$name-src"
+            New-Item -ItemType Directory -Force "$src\a\sub", "$src\b" | Out-Null
+            1..150 | ForEach-Object { Set-Content "$src\a\sub\IMG_$_.JPG" "photo-a-$_" }
+            1..100 | ForEach-Object { Set-Content "$src\b\VID_$_.mp4" "video-b-$_" }
+            1..3 | ForEach-Object { Set-Content "$src\b\note_$_.txt" "note-$_" }
+            # 날짜를 서로 다르게 만들어 두고, 옮긴 뒤 그대로인지 내용 해시로 짝지어 비교한다.
+            $i = 0
+            $before = @{}
+            Get-ChildItem $src -Recurse -File -Include *.jpg, *.mp4 | ForEach-Object {
+              $i++
+              $_.CreationTime = (Get-Date '2015-03-01').AddHours($i)
+              $_.LastWriteTime = (Get-Date '2016-03-01').AddHours($i)
+              $before[(Get-FileHash $_.FullName).Hash] = @($_.CreationTime, $_.LastWriteTime)
+            }
+            $p = Start-Process -FilePath build\Release\Google-Photo-Uploader.exe -ArgumentList '--organize','--dest',"`"$dest`"","`"$src\a`"","`"$src\b`"" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "[$name] unexpected exit code $($p.ExitCode)" }
+            $run = Get-ChildItem $dest -Directory | Select-Object -First 1
+            $chunks = Get-ChildItem $run.FullName -Directory | Sort-Object Name
+            $counts = ($chunks | ForEach-Object { (Get-ChildItem $_.FullName -File).Count }) -join ','
+            Write-Host "[$name] run=$($run.Name) chunks=$($chunks.Name -join ',') counts=$counts"
+            if (($chunks.Name -join ',') -ne '001,002,003' -or $counts -ne '100,100,50') { throw "[$name] unexpected chunks" }
+            $files = Get-ChildItem $run.FullName -Recurse -File
+            $bad = $files | Where-Object { $_.Name -notmatch '^\d{4}_\d{2}_\d{2}_\d{2}_[0-9a-f]{8}(_\d+)?\.(jpg|mp4)$' }
+            if ($bad) { throw "[$name] unexpected names: $($bad.Name -join ', ')" }
+            if ((Get-ChildItem $src -Recurse -File -Include *.jpg, *.mp4).Count -ne 0) { throw "[$name] media left in source" }
+            if ((Get-ChildItem $src -Recurse -File -Include *.txt).Count -ne 3) { throw "[$name] non-media files were moved" }
+            # 오래된 것부터: 앞 폴더의 마지막 시각 <= 뒤 폴더의 첫 시각
+            for ($c = 1; $c -lt $chunks.Count; $c++) {
+              $prev = (Get-ChildItem $chunks[$c - 1].FullName -File | Sort-Object Name | Select-Object -Last 1).Name.Substring(0, 13)
+              $next = (Get-ChildItem $chunks[$c].FullName -File | Sort-Object Name | Select-Object -First 1).Name.Substring(0, 13)
+              if ($prev -gt $next) { throw "[$name] chunk order $prev > $next" }
+            }
+            foreach ($f in $files) {
+              $t = $before[(Get-FileHash $f.FullName).Hash]
+              if (-not $t) { throw "[$name] content changed: $($f.Name)" }
+              if ($f.CreationTime -ne $t[0] -or $f.LastWriteTime -ne $t[1]) { throw "[$name] dates changed: $($f.Name) $($f.CreationTime) $($f.LastWriteTime)" }
+            }
+            Write-Host "[$name] content and dates preserved for $($files.Count) files"
+          }
+          Test-Organize 'same-drive' (Join-Path $env:RUNNER_TEMP 'smoke-dest')
+          Test-Organize 'other-drive' 'C:\smoke-dest'
       - name: Package
         shell: pwsh
         run: |
