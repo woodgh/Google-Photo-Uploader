@@ -74,10 +74,75 @@ jobs:
           }
           Test-Organize 'same-drive' (Join-Path $env:RUNNER_TEMP 'smoke-dest')
           Test-Organize 'other-drive' 'C:\smoke-dest'
+      # 가짜 adb(폰 흉내)로 업로드 흐름 전체를 확인한다: 복사 → 변동 없음 대기 → PC '업로드 완료'로 이동 → 폰에서 삭제 → 다음 묶음.
+      - name: Upload smoke test (fake phone)
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:RUNNER_TEMP 'upload-bin'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Copy-Item build\Release\Google-Photo-Uploader.exe $bin
+          Copy-Item build\Release\fake_adb.exe "$bin\adb.exe"
+          function New-Run([string]$name, [int[]]$counts) {
+            $run = Join-Path $env:RUNNER_TEMP $name
+            for ($c = 0; $c -lt $counts.Count; $c++) {
+              $dir = Join-Path $run ('{0:D3}' -f ($c + 1))
+              New-Item -ItemType Directory -Force $dir | Out-Null
+              1..$counts[$c] | ForEach-Object { Set-Content "$dir\2024_01_0$($c + 1)_1$($_)_$('{0:x8}' -f ($c * 100 + $_)).jpg" "$name-$c-$_" }
+            }
+            return $run
+          }
+          function Assert-Uploaded([string]$name, [string]$run, [string]$phone, [int]$total) {
+            Get-Content "$run\upload-log.txt" -Encoding utf8 | ForEach-Object { Write-Host "[$name] $_" }
+            $done = @(Get-ChildItem (Join-Path $run '업로드 완료') -Recurse -File).Count
+            $left = @(Get-ChildItem $run -Directory | Where-Object Name -match '^\d{3}$' | Get-ChildItem -File).Count
+            $onPhone = @(Get-ChildItem "$phone\sdcard\DCIM\Camera" -File -ErrorAction SilentlyContinue).Count
+            Write-Host "[$name] uploaded=$done left=$left onPhone=$onPhone"
+            if ($done -ne $total -or $left -ne 0 -or $onPhone -ne 0) { throw "[$name] unexpected upload result" }
+          }
+
+          # 묶음 2개씩, 변동 없음 2초: 5개 → 3묶음
+          $run = New-Run 'up-batch' @(3, 2)
+          $env:FAKE_ADB_ROOT = Join-Path $env:RUNNER_TEMP 'phone-batch'
+          New-Item -ItemType Directory -Force $env:FAKE_ADB_ROOT | Out-Null
+          $p = Start-Process "$bin\Google-Photo-Uploader.exe" -ArgumentList '--upload','--dir',"`"$run`"",'--batch','2','--quiet-seconds','2' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "[batch] exit code $($p.ExitCode)" }
+          Assert-Uploaded 'batch' $run $env:FAKE_ADB_ROOT 5
+          $pushes = @(Select-String -Path "$env:FAKE_ADB_ROOT\calls.log" -Pattern '^-s \| FAKE0001 \| push').Count
+          if ($pushes -ne 5) { throw "[batch] expected 5 pushes, got $pushes" }
+
+          # 슬로우(1개씩) + 백업 중 알림: 알림이 있는 동안은 완료로 보지 않아야 한다
+          $run = New-Run 'up-slow' @(2)
+          $env:FAKE_ADB_ROOT = Join-Path $env:RUNNER_TEMP 'phone-slow'
+          New-Item -ItemType Directory -Force $env:FAKE_ADB_ROOT | Out-Null
+          @(
+            '  Notification List:',
+            '    NotificationRecord(0x1: pkg=com.google.android.apps.photos user=UserHandle{0} id=1 tag=null importance=2 key=k: Notification(channel=backup pri=-1 flags=0x62 category=progress))',
+            '      extras={',
+            '        android.title=String (Backing up)',
+            '        android.progress=Integer (0)',
+            '        android.progressMax=Integer (1)',
+            '      }'
+          ) | Set-Content "$env:FAKE_ADB_ROOT\notification.txt"
+          $p = Start-Process "$bin\Google-Photo-Uploader.exe" -ArgumentList '--upload','--dir',"`"$run`"",'--batch','1','--quiet-seconds','2' -PassThru
+          Start-Sleep -Seconds 12
+          if (Test-Path (Join-Path $run '업로드 완료')) { throw '[slow] completed while Google Photos was still backing up' }
+          if (@(Get-ChildItem "$env:FAKE_ADB_ROOT\sdcard\DCIM\Camera" -File).Count -ne 1) { throw '[slow] expected exactly 1 file on phone' }
+          Remove-Item "$env:FAKE_ADB_ROOT\notification.txt"
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw '[slow] did not finish' }
+          if ($p.ExitCode -ne 0) { throw "[slow] exit code $($p.ExitCode)" }
+          Assert-Uploaded 'slow' $run $env:FAKE_ADB_ROOT 2
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist, zip | Out-Null
+          # adb (Google platform-tools): 폰 업로드에 쓴다. 앱과 같은 폴더에 둔다.
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile platform-tools.zip
+          Expand-Archive platform-tools.zip -DestinationPath . -Force
+          foreach ($f in 'adb.exe','AdbWinApi.dll','AdbWinUsbApi.dll') { Copy-Item "platform-tools\$f" "zip\$f" }
+          & zip\adb.exe version
+          if ($LASTEXITCODE -ne 0) { throw 'adb does not run' }
+          & zip\adb.exe kill-server
           # zip: 실행 파일 + 사용 설명서 + 빌드 이름. 파일 이름에 빌드 이름을 넣어 받은 파일의 버전을 바로 알 수 있게 한다.
           Copy-Item build/Release/Google-Photo-Uploader.exe zip/Google-Photo-Uploader.exe
           Copy-Item README.md zip/README.md
@@ -117,8 +182,10 @@ jobs:
 
           받을 파일: **$zipName** — 압축을 풀고 Google-Photo-Uploader.exe를 실행하세요(설치 없음, 사용 설명서 README.md 포함). 아래 "Source code" 압축은 GitHub가 자동으로 붙이는 소스라 받을 필요가 없습니다.
 
-          사용법: 폴더 여러 개를 창에 끌어다 놓거나 [폴더 추가]로 고른 뒤 [완료]를 누르세요.
+          ① 정리: 폴더 여러 개를 창에 끌어다 놓거나 [폴더 추가]로 고른 뒤 [완료]를 누르세요.
           사진·동영상을 촬영 시각 순으로 100개씩 나눠 <저장 폴더>\<실행 시각>\001, 002 ... 로 옮기고, 파일 이름을 년_월_일_시_해쉬.확장자 로 바꿉니다.
+          ② 폰 업로드: Pixel 폰을 USB 디버깅으로 연결하고 [업로드 시작]. 묶음(슬로우 1개 / 50개 / 100개)씩 폰 DCIM/Camera에 넣고,
+          Google 포토 알림에 정한 시간 동안 변동이 없으면 PC 파일을 '업로드 완료' 폴더로 옮기고 폰 사본을 지운 뒤 다음 묶음을 넣습니다. (adb 포함)
 
           서명되지 않은 실행 파일이라 SmartScreen 경고가 뜨면 [추가 정보] → [실행]을 누르세요. 빌드: ${{ github.server_url }}/$repo/actions/runs/${{ github.run_id }}
           "@
