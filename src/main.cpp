@@ -9,6 +9,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 
+#include <atomic>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -165,6 +166,34 @@ void OnDestChange() {
 
 // --- 정리 실행 ----------------------------------------------------------------
 
+// 작업 스레드들의 진행 보고. 마지막 값만 남기고, 창에 보낸 메시지가 처리되기 전에는 더 보내지 않는다.
+struct ProgressState {
+  std::atomic<int> phase{0};
+  std::atomic<size_t> done{0}, total{0};
+  std::atomic<bool> pending{false};
+};
+ProgressState g_progress;
+
+void ReportProgress(HWND hwnd, gpu::Phase phase, size_t done, size_t total) {
+  const int p = static_cast<int>(phase);
+  if (g_progress.phase.exchange(p) != p) {
+    g_progress.done = done;  // 단계가 바뀌는 보고는 한 스레드에서만 온다
+  } else {
+    // 여러 워커가 순서 없이 보고하므로 큰 값만 남긴다
+    size_t cur = g_progress.done;
+    while (cur < done && !g_progress.done.compare_exchange_weak(cur, done)) {
+    }
+  }
+  g_progress.total = total;
+  if (!g_progress.pending.exchange(true)) PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0);
+}
+
+std::wstring WithCommas(size_t n) {
+  auto digits = std::to_wstring(n);
+  for (int i = static_cast<int>(digits.size()) - 3; i > 0; i -= 3) digits.insert(static_cast<size_t>(i), L",");
+  return digits;
+}
+
 void OnDone() {
   if (g.sources.empty() || g.busy) return;
   for (const auto& s : g.sources) {
@@ -186,25 +215,35 @@ void OnDone() {
   g.busy = true;
   UpdateButtons();
   SendMessageW(g.progress, PBM_SETPOS, 0, 0);
-  SetStatus(L"파일을 찾는 중...");
+  g_progress.phase = 0;
+  g_progress.done = 0;
+  g_progress.total = 0;
+  SetStatus(L"폴더를 살펴보는 중...");
   std::thread([hwnd = g.hwnd, sources = g.sources, dest = g.destRoot] {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     auto result = std::make_unique<gpu::OrganizeResult>(gpu::Organize(sources, dest, [hwnd](gpu::Phase phase, size_t done, size_t total) {
-      // 진행률: 찾기 0~5%, 읽기 5~60%, 이동 60~100%
-      const int base[] = {0, 50, 600}, span[] = {50, 550, 400};
-      const int i = static_cast<int>(phase);
-      const int pos = base[i] + (total ? static_cast<int>(span[i] * done / total) : 0);
-      PostMessageW(hwnd, WM_APP_PROGRESS, static_cast<WPARAM>(phase), MAKELPARAM(pos, 0));
+      ReportProgress(hwnd, phase, done, total);
     }));
     CoUninitialize();
     PostMessageW(hwnd, WM_APP_FINISHED, 0, reinterpret_cast<LPARAM>(result.release()));
   }).detach();
 }
 
-void OnProgress(gpu::Phase phase, int pos) {
-  static const wchar_t* const kText[] = {L"파일을 찾는 중...", L"촬영 시각과 해시를 읽는 중...", L"폴더로 옮기는 중..."};
-  SendMessageW(g.progress, PBM_SETPOS, pos, 0);
-  SetStatus(kText[static_cast<int>(phase)]);
+void OnProgress() {
+  g_progress.pending = false;  // 먼저 내려야 이후 보고가 새 메시지를 보낸다
+  const auto phase = static_cast<gpu::Phase>(g_progress.phase.load());
+  const size_t done = g_progress.done, total = g_progress.total;
+  // 진행률: 찾기 0~5%, 읽기 5~60%, 이동 60~100%
+  const int base[] = {0, 50, 600}, span[] = {50, 550, 400};
+  const int i = static_cast<int>(phase);
+  SendMessageW(g.progress, PBM_SETPOS, base[i] + (total ? static_cast<int>(span[i] * done / total) : 0), 0);
+  static const wchar_t* const kText[] = {L"폴더를 살펴보는 중", L"촬영 시각과 해시를 읽는 중", L"폴더로 옮기는 중"};
+  std::wstring text = kText[i];
+  if (phase == gpu::Phase::Collect)
+    text += L"...";
+  else
+    text += L"...  " + WithCommas(done) + L" / " + WithCommas(total) + L"개";
+  SetStatus(text);
 }
 
 void OnFinished(std::unique_ptr<gpu::OrganizeResult> r) {
@@ -366,7 +405,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return 0;
     case WM_APP_PROGRESS:
-      OnProgress(static_cast<gpu::Phase>(wp), LOWORD(lp));
+      OnProgress();
       return 0;
     case WM_APP_FINISHED:
       OnFinished(std::unique_ptr<gpu::OrganizeResult>(reinterpret_cast<gpu::OrganizeResult*>(lp)));
