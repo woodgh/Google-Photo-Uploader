@@ -1,0 +1,2 @@
+#pragma once
+#define GPU_VERSION L"@GPU_VERSION@"

@@ -1,0 +1,102 @@
+name: Windows build and release
+# 버전 태그를 만들지 않는다.
+# 모든 push/PR: 빌드 + 테스트. main push: 고정 Release "Google-Photo-Uploader (main)"의 zip을 새 빌드로 교체한다.
+# (GitHub Release에는 태그가 필요하므로 내부용 고정 태그 uploader-main을 매번 최신 커밋으로 옮긴다.)
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: write
+concurrency:
+  group: uploader-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  RELEASE_TAG: uploader-main
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build name
+        shell: pwsh
+        run: |
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          $branch = '${{ github.ref_name }}' -replace '[^A-Za-z0-9._-]', '-'
+          "GPU_VERSION=$branch.${{ github.run_number }}-$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Configure
+        run: cmake -S . -B build -A x64 "-DGPU_VERSION=${{ env.GPU_VERSION }}"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test naming rules
+        run: ctest --test-dir build -C Release --output-on-failure
+      # 창 없이 실제 정리를 돌려 본다: 사진 250개 + 문서 3개 → 001(100) 002(100) 003(50), 문서는 제자리.
+      - name: Organize smoke test
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:RUNNER_TEMP 'smoke-src'
+          $dest = Join-Path $env:RUNNER_TEMP 'smoke-dest'
+          New-Item -ItemType Directory -Force "$src\a\sub", "$src\b" | Out-Null
+          1..150 | ForEach-Object { Set-Content "$src\a\sub\IMG_$_.JPG" "photo-a-$_" }
+          1..100 | ForEach-Object { Set-Content "$src\b\VID_$_.mp4" "video-b-$_" }
+          1..3 | ForEach-Object { Set-Content "$src\b\note_$_.txt" "note-$_" }
+          $p = Start-Process -FilePath build\Release\Google-Photo-Uploader.exe -ArgumentList '--organize','--dest',"`"$dest`"","`"$src\a`"","`"$src\b`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "unexpected exit code $($p.ExitCode)" }
+          $run = Get-ChildItem $dest -Directory | Select-Object -First 1
+          $chunks = Get-ChildItem $run.FullName -Directory | Sort-Object Name
+          $counts = ($chunks | ForEach-Object { (Get-ChildItem $_.FullName -File).Count }) -join ','
+          Write-Host "run=$($run.Name) chunks=$($chunks.Name -join ',') counts=$counts"
+          if (($chunks.Name -join ',') -ne '001,002,003' -or $counts -ne '100,100,50') { throw 'unexpected chunks' }
+          $bad = Get-ChildItem $run.FullName -Recurse -File | Where-Object { $_.Name -notmatch '^\d{4}_\d{2}_\d{2}_\d{2}_[0-9a-f]{8}(_\d+)?\.(jpg|mp4)$' }
+          if ($bad) { throw "unexpected names: $($bad.Name -join ', ')" }
+          if ((Get-ChildItem $src -Recurse -File -Include *.jpg, *.mp4).Count -ne 0) { throw 'media left in source' }
+          if ((Get-ChildItem $src -Recurse -File -Include *.txt).Count -ne 3) { throw 'non-media files were moved' }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist, zip | Out-Null
+          # zip: 실행 파일 + 사용 설명서 + 빌드 이름. 파일 이름에 빌드 이름을 넣어 받은 파일의 버전을 바로 알 수 있게 한다.
+          Copy-Item build/Release/Google-Photo-Uploader.exe zip/Google-Photo-Uploader.exe
+          Copy-Item README.md zip/README.md
+          "Google-Photo-Uploader ${{ env.GPU_VERSION }}`r`ncommit ${{ github.sha }}" | Out-File -FilePath zip/VERSION.txt -Encoding utf8
+          # 압축 시작 시각(한국 시간, 년-월-일-시-분)을 파일 이름에 넣는다.
+          $kst = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTime]::UtcNow, 'Korea Standard Time').ToString('yyyy-MM-dd-HH-mm')
+          Compress-Archive -Path zip/* -DestinationPath "dist/Google-Photo-Uploader-$kst-${{ env.GPU_VERSION }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Google-Photo-Uploader-Windows-x64
+          path: dist/
+          retention-days: 14
+
+  release:
+    needs: windows
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Google-Photo-Uploader-Windows-x64
+          path: dist
+      - name: Replace the main release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $repo = '${{ github.repository }}'
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          $build = "main.${{ github.run_number }}-$sha"
+          $zip = Get-ChildItem dist -Filter 'Google-Photo-Uploader-*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'versioned zip not found' }
+          $zipName = $zip.Name
+          $notes = @"
+          Google-Photo-Uploader — main 최신 빌드 ``$build``. 창 제목에 같은 빌드 이름이 표시됩니다.
+
+          받을 파일: **$zipName** — 압축을 풀고 Google-Photo-Uploader.exe를 실행하세요(설치 없음, 사용 설명서 README.md 포함). 아래 "Source code" 압축은 GitHub가 자동으로 붙이는 소스라 받을 필요가 없습니다.
+
+          사용법: 폴더 여러 개를 창에 끌어다 놓거나 [폴더 추가]로 고른 뒤 [완료]를 누르세요.
+          사진·동영상을 촬영 시각 순으로 100개씩 나눠 <저장 폴더>\<실행 시각>\001, 002 ... 로 옮기고, 파일 이름을 년_월_일_시_해쉬.확장자 로 바꿉니다.
+
+          서명되지 않은 실행 파일이라 SmartScreen 경고가 뜨면 [추가 정보] → [실행]을 누르세요. 빌드: ${{ github.server_url }}/$repo/actions/runs/${{ github.run_id }}
+          "@
+          # 같은 Release를 지우고 같은 태그 이름으로 다시 만든다 → 다운로드 주소는 그대로, 파일만 최신으로 바뀐다.
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) { gh release delete $tag --repo $repo --cleanup-tag --yes }
+          gh release create $tag $zip.FullName --repo $repo --target '${{ github.sha }}' --title "Google-Photo-Uploader (main)" --notes $notes --latest
